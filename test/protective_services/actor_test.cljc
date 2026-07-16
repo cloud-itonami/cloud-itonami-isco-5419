@@ -1,0 +1,104 @@
+(ns protective-services.actor-test
+  "End-to-end tests of the compiled StateGraph, exercising ONLY the public
+   `actor/build-graph`, `actor/run-request!`, and `actor/approve!` entry
+   points — never a private node function directly."
+  (:require [clojure.test :refer [deftest is testing]]
+            [protective-services.actor :as actor]
+            [protective-services.advisor :as advisor]
+            [protective-services.store :as store]))
+
+(defn- seeded-store []
+  (-> (store/create-store)
+      (store/register-practitioner! "prac-001" {:name "Alex Rivera"})
+      (store/register-post! "post-001" {:client "Riverside Mall" :authorized? true})))
+
+(deftest test-clean-proposal-commits-and-writes-the-ledger
+  (testing "A well-formed, cited patrol-round log runs the full graph to
+            :complete and appends exactly one ledger record"
+    (let [st (seeded-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:practitioner-id "prac-001" :type :log-patrol-round
+                    :post "post-001" :checkpoints ["gate" "loading-dock"]
+                    :post-orders-ref ["post-orders-v3"]}
+          final (actor/run-request! g request {})]
+      (is (= :complete (:phase final)))
+      (is (nil? (:error final)))
+      (is (= [{:recorded true :op :log-patrol-round}] (:records final)))
+      (is (= 1 (count (store/records (:store final)))))
+      (is (= :log-patrol-round (:type (first (store/records (:store final)))))))))
+
+(deftest test-forbidden-operation-holds-and-cannot-be-approved
+  (testing "A request that only maps to :unknown (out-of-scope) hard-stops at
+            :hold, records a :governor-hold audit fact, and approve! refuses to
+            act on a :rejected state"
+    (let [st (seeded-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:practitioner-id "prac-001" :type :not-a-real-operation}
+          final (actor/run-request! g request {})]
+      (is (= :rejected (:phase final)))
+      (is (some? (:error final)))
+      (is (= 1 (count (store/records (:store final)))))
+      (is (= :governor-hold (:type (first (store/records (:store final))))))
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                    (actor/approve! final {:approver "supervisor"} (:store final)))))))
+
+(deftest test-security-concern-flag-always-holds-regardless-of-confidence
+  (testing "flag-security-concern hard-stops even though the advisor proposes it
+            at high (0.95) confidence — this is the actor's cardinal
+            always-escalate/no-auto-proceed invariant, proven end-to-end"
+    (let [st (seeded-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:practitioner-id "prac-001" :type :flag-security-concern
+                    :post "post-001" :concern-type :suspicious-vehicle
+                    :description "vehicle circling the lot"
+                    :observation-ref ["direct-observation"]}
+          final (actor/run-request! g request {})]
+      (is (= :rejected (:phase final)))
+      (is (some #(= :safety-concern-escalation (:rule %)) (-> final :decision :violations))))))
+
+(deftest test-draft-incident-report-awaits-approval-then-commits
+  (testing "draft-incident-report always stops at :awaiting-approval (never
+            auto-commits), and a human approve! then completes it as a draft
+            record — distinct from the permanent hold above"
+    (let [st (seeded-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:practitioner-id "prac-001" :type :draft-incident-report
+                    :post "post-001" :summary "unattended bag reported"
+                    :witness-refs ["witness-1"]}
+          held (actor/run-request! g request {})]
+      (is (= :awaiting-approval (:phase held)))
+      (is (nil? (:store held)) "nothing is written to the ledger before human sign-off")
+      (let [approved (actor/approve! held {:approver "supervisor"} st)]
+        (is (= :complete (:phase approved)))
+        (is (true? (-> approved :records first :approved)))
+        (is (= 1 (count (store/records (:store approved)))))))))
+
+(deftest test-schedule-shift-assignment-against-authorized-post-commits
+  (testing "Scheduling against a registered, authorized post with a roster
+            citation runs the full graph to :complete end-to-end — contrasts
+            with the unauthorized-post hold path below. (The confidence-floor
+            escalation path itself is exercised directly against the public
+            governor/check entry point in governor_test.cljc, since the mock
+            advisor's per-type confidence is fixed and not independently
+            drivable through the graph.)"
+    (let [st (seeded-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:practitioner-id "prac-001" :type :schedule-shift-assignment
+                    :post "post-001"
+                    :shift-window ["2026-07-17T22:00:00Z" "2026-07-18T06:00:00Z"]
+                    :roster-ref ["roster-week-29"]}
+          final (actor/run-request! g request {})]
+      (is (= :complete (:phase final))))))
+
+(deftest test-schedule-shift-assignment-against-unauthorized-post-holds
+  (testing "Scheduling against a post whose client-authorization has not been
+            verified hard-stops end-to-end, mirroring business-model.md's
+            Trust Control"
+    (let [st (-> (seeded-store)
+                 (store/register-post! "post-002" {:client "Unverified Client" :authorized? false}))
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:practitioner-id "prac-001" :type :schedule-shift-assignment
+                    :post "post-002" :shift-window ["x" "y"] :roster-ref ["roster"]}
+          final (actor/run-request! g request {})]
+      (is (= :rejected (:phase final)))
+      (is (some #(= :post-not-authorized (:rule %)) (-> final :decision :violations))))))

@@ -1,0 +1,97 @@
+(ns protective-services.advisor-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [protective-services.advisor :as advisor]))
+
+(deftest test-mock-advisor-always-proposes
+  (testing "mock-advisor always returns :effect :propose, never :execute or any
+            actuating effect"
+    (let [a (advisor/mock-advisor)
+          proposal (advisor/propose a {:type :log-patrol-round} {})]
+      (is (= :propose (:effect proposal))))))
+
+(deftest test-log-patrol-round
+  (testing "log-patrol-round proposal carries checkpoints and a citation slot"
+    (let [a (advisor/mock-advisor)
+          request {:type :log-patrol-round
+                    :post "post-001"
+                    :checkpoints ["gate" "loading-dock"]
+                    :round-time "2026-07-16T02:00:00Z"
+                    :post-orders-ref ["post-orders-v3"]}
+          proposal (advisor/propose a request {})]
+      (is (= :log-patrol-round (:op proposal)))
+      (is (= :propose (:effect proposal)))
+      (is (= ["gate" "loading-dock"] (:checkpoints proposal)))
+      (is (= ["post-orders-v3"] (:cites proposal)))
+      (is (pos? (:confidence proposal))))))
+
+(deftest test-draft-incident-report-is-always-marked-draft
+  (testing "draft-incident-report proposals are always marked :draft? true —
+            this advisor never claims to produce a final legal record"
+    (let [a (advisor/mock-advisor)
+          request {:type :draft-incident-report
+                    :post "post-001"
+                    :summary "unattended bag reported at east entrance"
+                    :witness-refs ["witness-1"]}
+          proposal (advisor/propose a request {})]
+      (is (= :draft-incident-report (:op proposal)))
+      (is (true? (:draft? proposal)))
+      (is (= ["witness-1"] (:cites proposal))))))
+
+(deftest test-schedule-shift-assignment
+  (testing "schedule-shift-assignment proposal carries the post and shift window"
+    (let [a (advisor/mock-advisor)
+          request {:type :schedule-shift-assignment
+                    :post "post-001"
+                    :shift-window ["2026-07-17T22:00:00Z" "2026-07-18T06:00:00Z"]
+                    :roster-ref ["roster-week-29"]}
+          proposal (advisor/propose a request {})]
+      (is (= :schedule-shift-assignment (:op proposal)))
+      (is (= "post-001" (:post proposal)))
+      (is (= ["roster-week-29"] (:cites proposal))))))
+
+(deftest test-log-access-control-entry
+  (testing "log-access-control-entry proposal carries visitor and direction"
+    (let [a (advisor/mock-advisor)
+          request {:type :log-access-control-entry
+                    :post "post-001"
+                    :visitor-id "v-77"
+                    :direction :in
+                    :sign-in-sheet-ref ["sheet-2026-07-16"]}
+          proposal (advisor/propose a request {})]
+      (is (= :log-access-control-entry (:op proposal)))
+      (is (= "v-77" (:visitor-id proposal)))
+      (is (= :in (:direction proposal))))))
+
+(deftest test-flag-security-concern-never-proposes-a-response
+  (testing "flag-security-concern proposal only carries concern description/type
+            — it never contains any response, dispatch, or force-related keys"
+    (let [a (advisor/mock-advisor)
+          request {:type :flag-security-concern
+                    :post "post-001"
+                    :concern-type :suspicious-vehicle
+                    :description "vehicle circling the lot three times"
+                    :observation-ref ["direct-observation"]}
+          proposal (advisor/propose a request {})]
+      (is (= :flag-security-concern (:op proposal)))
+      (is (= :suspicious-vehicle (:concern-type proposal)))
+      (is (not (contains? proposal :response)))
+      (is (not (contains? proposal :dispatch)))
+      (is (not (contains? proposal :force))))))
+
+(deftest test-unrecognized-request-type-yields-unknown-zero-confidence
+  (testing "An unrecognized request :type never gets a fabricated/free-form op —
+            it always falls back to :unknown with 0.0 confidence"
+    (let [a (advisor/mock-advisor)
+          proposal (advisor/propose a {:type :do-something-not-in-scope} {})]
+      (is (= :unknown (:op proposal)))
+      (is (= 0.0 (:confidence proposal)))
+      (is (= :propose (:effect proposal))))))
+
+(deftest test-llm-advisor-placeholder-is-conservative
+  (testing "llm-advisor (unwired placeholder) always yields :unknown / 0.0
+            confidence, forcing the governor to escalate rather than guess"
+    (let [a (advisor/llm-advisor nil)
+          proposal (advisor/propose a {:type :log-patrol-round} {})]
+      (is (= :unknown (:op proposal)))
+      (is (= 0.0 (:confidence proposal)))
+      (is (= :propose (:effect proposal))))))

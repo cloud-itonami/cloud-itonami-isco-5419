@@ -1,0 +1,231 @@
+(ns protective-services.governor-test
+  "Tests exercise ONLY the public `governor/check` and `governor/hold-fact`
+   entry points — never a private helper directly (that exact mistake
+   broke cloud-itonami-isic-0710 for a full day: a private var is not a
+   stable/compilable test target). Every governor rule is proven through
+   its real call path."
+  (:require [clojure.test :refer [deftest is testing]]
+            [protective-services.governor :as gov]
+            [protective-services.store :as store]))
+
+(defn- registered-store
+  "A store with one registered practitioner and one authorized post,
+   for tests that aren't specifically exercising provenance/authorization
+   failures."
+  []
+  (-> (store/create-store)
+      (store/register-practitioner! "prac-001" {:name "Alex Rivera"})
+      (store/register-post! "post-001" {:client "Riverside Mall" :authorized? true})))
+
+;; ------------------------- provenance / actuation -------------------------
+
+(deftest test-unregistered-practitioner-is-hard-violation
+  (testing "An unregistered practitioner is a hard violation"
+    (let [st (store/create-store)
+          request {:practitioner-id "unknown-prac"}
+          proposal {:op :log-patrol-round :effect :propose :confidence 0.9 :cites ["post-orders"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (false? (:ok? verdict)))
+      (is (some #(= :practitioner-not-registered (:rule %)) (:violations verdict))))))
+
+(deftest test-non-propose-effect-is-hard-violation
+  (testing "A non-:propose effect is a hard violation — this actor never acts"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :log-patrol-round :effect :execute :confidence 0.9 :cites ["post-orders"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :no-actuation (:rule %)) (:violations verdict))))))
+
+;; ------------------------- forbidden operations (no override) -------------------------
+
+(deftest test-use-of-force-authorization-is-forever-forbidden
+  (testing "Use-of-force authorization is a hard violation, never overridable"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :authorize-use-of-force :effect :propose :confidence 0.99 :cites ["anything"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (false? (:ok? verdict)))
+      (is (some #(= :forbidden-operation (:rule %)) (:violations verdict))))))
+
+(deftest test-arrest-or-detention-authority-is-forever-forbidden
+  (testing "Arrest/detention authority is a hard violation, never overridable"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :authorize-arrest-or-detention :effect :propose :confidence 0.99 :cites ["anything"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :forbidden-operation (:rule %)) (:violations verdict))))))
+
+(deftest test-armed-response-dispatch-is-forever-forbidden
+  (testing "Armed-response dispatch is a hard violation, never overridable"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :dispatch-armed-response :effect :propose :confidence 0.99 :cites ["anything"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :forbidden-operation (:rule %)) (:violations verdict))))))
+
+(deftest test-forbidden-operation-cannot-be-overridden-by-simulated-human-approval
+  (testing "Even a proposal/context claiming human approval and max confidence
+            does not clear a forbidden operation — there is no override path"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          context {:human-approved? true :approver "supervisor"}
+          proposal {:op :authorize-use-of-force :effect :propose :confidence 1.0
+                    :cites ["supervisor-order"] :human-approved? true}
+          verdict (gov/check request context proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (false? (:ok? verdict)))
+      (is (some #(= :forbidden-operation (:rule %)) (:violations verdict))))))
+
+(deftest test-unknown-op-is-forbidden
+  (testing "An unrecognized/out-of-scope op is a hard violation"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :unknown :effect :propose :confidence 0.0}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :forbidden-operation (:rule %)) (:violations verdict))))))
+
+;; ------------------------- safety-concern always-escalate (hard stop) -------------------------
+
+(deftest test-flag-security-concern-always-hard-stops-even-at-high-confidence
+  (testing "flag-security-concern is ALWAYS a hard stop, regardless of confidence,
+            citations, or a registered practitioner — no exceptions"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001" :post "post-001"}
+          proposal {:op :flag-security-concern :effect :propose :confidence 0.95
+                    :post "post-001" :concern-type :suspicious-vehicle
+                    :cites ["direct-observation"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (true? (:escalate? verdict)))
+      (is (false? (:ok? verdict)))
+      (is (some #(= :safety-concern-escalation (:rule %)) (:violations verdict))))))
+
+(deftest test-flag-security-concern-hold-fact-is-auditable
+  (testing "hold-fact produces an auditable record referencing the safety-concern
+            rule and the op that was actually judged"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001" :post "post-001"}
+          proposal {:op :flag-security-concern :effect :propose :confidence 0.95
+                    :post "post-001" :cites ["direct-observation"]}
+          verdict (gov/check request {} proposal st)
+          fact (gov/hold-fact request {} proposal verdict)]
+      (is (= :governor-hold (:t fact)))
+      (is (= :hold (:disposition fact)))
+      (is (= :flag-security-concern (:op fact)))
+      (is (= "prac-001" (:practitioner fact)))
+      (is (some #(= :safety-concern-escalation %) (:basis fact))))))
+
+;; ------------------------- post/client-authorization -------------------------
+
+(deftest test-schedule-shift-assignment-missing-post-record-is-hard-violation
+  (testing "Scheduling against an unregistered post is a hard violation"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :schedule-shift-assignment :effect :propose :confidence 0.9
+                    :post "post-999" :cites ["roster"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :post-record-missing (:rule %)) (:violations verdict))))))
+
+(deftest test-schedule-shift-assignment-unauthorized-post-is-hard-violation
+  (testing "Scheduling against a post whose client-authorization is not verified
+            is a hard violation — mirrors business-model.md's Trust Control"
+    (let [st (-> (registered-store)
+                 (store/register-post! "post-002" {:client "Unverified Client" :authorized? false}))
+          request {:practitioner-id "prac-001"}
+          proposal {:op :schedule-shift-assignment :effect :propose :confidence 0.9
+                    :post "post-002" :cites ["roster"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :post-not-authorized (:rule %)) (:violations verdict))))))
+
+(deftest test-schedule-shift-assignment-authorized-post-passes
+  (testing "Scheduling against a registered, authorized post with citations passes"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :schedule-shift-assignment :effect :propose :confidence 0.85
+                    :post "post-001" :cites ["roster-ref-17"]}
+          verdict (gov/check request {} proposal st)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:ok? verdict))))))
+
+;; ------------------------- spec-basis -------------------------
+
+(deftest test-missing-cites-is-hard-violation
+  (testing "A known-op proposal with no cited basis is a hard violation"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :log-patrol-round :effect :propose :confidence 0.9 :cites []}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:hard? verdict)))
+      (is (some #(= :no-spec-basis (:rule %)) (:violations verdict))))))
+
+;; ------------------------- routine, clean proposals pass -------------------------
+
+(deftest test-valid-log-patrol-round-passes
+  (testing "A well-formed, cited, high-confidence patrol log from a registered
+            practitioner passes cleanly"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :log-patrol-round :effect :propose :confidence 0.9
+                    :post "post-001" :checkpoints ["gate" "loading-dock"]
+                    :cites ["post-orders-v3"]}
+          verdict (gov/check request {} proposal st)]
+      (is (false? (:hard? verdict)))
+      (is (false? (:escalate? verdict)))
+      (is (true? (:ok? verdict)))
+      (is (empty? (:violations verdict))))))
+
+(deftest test-valid-log-access-control-entry-passes
+  (testing "A well-formed, cited access-control log entry passes cleanly"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :log-access-control-entry :effect :propose :confidence 0.9
+                    :post "post-001" :visitor-id "v-77" :direction :in
+                    :cites ["sign-in-sheet-2026-07-16"]}
+          verdict (gov/check request {} proposal st)]
+      (is (true? (:ok? verdict))))))
+
+;; ------------------------- soft escalation (not permanently blocked) -------------------------
+
+(deftest test-draft-incident-report-always-escalates-but-is-not-a-hard-stop
+  (testing "Incident-report drafting always requires human review before being
+            treated as final, but — unlike flag-security-concern — is not a
+            permanent hard stop: it is a legitimate op awaiting sign-off"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :draft-incident-report :effect :propose :confidence 0.9
+                    :post "post-001" :summary "minor property damage observed"
+                    :cites ["witness-statement-1"]}
+          verdict (gov/check request {} proposal st)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:escalate? verdict)))
+      (is (false? (:ok? verdict))))))
+
+(deftest test-low-confidence-escalates
+  (testing "Low confidence (<0.6) on an otherwise clean proposal escalates rather
+            than auto-committing"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :log-patrol-round :effect :propose :confidence 0.4
+                    :post "post-001" :cites ["post-orders-v3"]}
+          verdict (gov/check request {} proposal st)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:escalate? verdict)))
+      (is (false? (:ok? verdict))))))
+
+(deftest test-missing-confidence-defaults-to-zero-and-escalates
+  (testing "A proposal with no :confidence key at all is treated as 0.0 confidence,
+            never silently treated as trustworthy"
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001"}
+          proposal {:op :log-patrol-round :effect :propose :post "post-001" :cites ["x"]}
+          verdict (gov/check request {} proposal st)]
+      (is (= 0.0 (:confidence verdict)))
+      (is (true? (:escalate? verdict))))))
