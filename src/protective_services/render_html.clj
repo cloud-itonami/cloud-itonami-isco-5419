@@ -1,0 +1,291 @@
+(ns protective-services.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300)
+  for cloud-itonami-isco-5419: this repo previously had no demo page and
+  no generator at all (only a README line pointing at a file that did
+  not exist yet).
+
+  This namespace drives the REAL actor stack (`protective-services.actor`
+  built against `protective-services.advisor/mock-advisor` and a real
+  `protective-services.store/MemStore`) through a scenario built from:
+    - the existing test fixture's seed data verbatim
+      (`prac-001` \"Alex Rivera\" / `post-001` \"Riverside Mall\",
+      authorized), taken from `test/protective_services/actor_test.cljc`'s
+      `seeded-store`
+    - one disclosed demo-only addition, `post-002` (\"Unverified Client\",
+      NOT authorized) — registered here via the real
+      `store/register-post!` API, the same fixture already used inline in
+      `actor_test.cljc`'s unauthorized-post test, not invented data.
+
+  Every other field this page displays is real output read after the
+  compiled StateGraph actually ran (`actor/run-request!` / `actor/approve!`).
+  No timestamps or random values are embedded in the page content, so the
+  output is byte-identical across reruns against the same seed.
+
+  Architecture note (honest, not a bug): `store-instance` is closed over
+  by `actor/build-graph` as an immutable value, so a single compiled graph
+  does not see writes from a *later* `run-request!`/`approve!` call made
+  against a different, freshly-returned store. To show a cumulative ledger
+  across the whole demo (rather than each op only ever seeing its own
+  single resulting record), this generator rebuilds the graph before each
+  op-spec, threading the previous step's returned `:store` value in as the
+  next step's seed — see `run-op!`/`run-demo!` below.
+
+  Two governor rules are NOT reachable through `run-request!` with
+  `mock-advisor` and are disclosed as such rather than silently omitted:
+    - `no-actuation` — `mock-advisor` always returns `:effect :propose`,
+      so a non-`:propose` effect can never arise from a real proposal;
+      `governor_test.cljc`'s `test-non-propose-effect-is-hard-violation`
+      exercises this rule directly against `governor/check` instead.
+    - low-confidence escalation — `mock-advisor`'s per-request-type
+      confidence values (0.7–0.95) are all fixed and all clear the 0.6
+      floor; `governor_test.cljc`'s `test-low-confidence-escalates` and
+      `actor_test.cljc`'s own docstring note the same gap.
+
+  Usage: `clojure -M:render-html [out-file]` (default
+  `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [protective-services.store :as store]
+            [protective-services.advisor :as advisor]
+            [protective-services.actor :as actor]))
+
+(def ^:private op-specs
+  "The demo scenario: one request map per row of the audit trail, chosen to
+   drive through as many real hard-violation/escalation rules as the real
+   advisor/governor/store API allow. Comment on each documents which rule
+   (if any) it is expected to trigger."
+  [;; 1. Clean, cited patrol-round log against an authorized post -> commit.
+   {:practitioner-id "prac-001" :type :log-patrol-round
+    :post "post-001" :checkpoints ["gate" "loading-dock"]
+    :post-orders-ref ["post-orders-v3"]}
+
+   ;; 2. Same op, but with no cited basis at all -> :no-spec-basis hold.
+   {:practitioner-id "prac-001" :type :log-patrol-round
+    :post "post-001" :checkpoints ["gate"]}
+
+   ;; 3. Incident-report drafting always escalates to :awaiting-approval,
+   ;;    never auto-commits -> approve! completes it as a draft record.
+   {:practitioner-id "prac-001" :type :draft-incident-report
+    :post "post-001" :summary "unattended bag reported near west entrance"
+    :witness-refs ["witness-1"]}
+
+   ;; 4. Scheduling against a registered, client-authorized post -> commit.
+   {:practitioner-id "prac-001" :type :schedule-shift-assignment
+    :post "post-001" :shift-window ["2026-07-19T22:00:00Z" "2026-07-20T06:00:00Z"]
+    :roster-ref ["roster-week-29"]}
+
+   ;; 5. Scheduling against a registered but UNAUTHORIZED post
+   ;;    -> :post-not-authorized hold.
+   {:practitioner-id "prac-001" :type :schedule-shift-assignment
+    :post "post-002" :shift-window ["2026-07-19T22:00:00Z" "2026-07-20T06:00:00Z"]
+    :roster-ref ["roster-week-29"]}
+
+   ;; 6. Scheduling against a post with no registered record at all
+   ;;    -> :post-record-missing hold.
+   {:practitioner-id "prac-001" :type :schedule-shift-assignment
+    :post "post-404" :shift-window ["2026-07-19T22:00:00Z" "2026-07-20T06:00:00Z"]
+    :roster-ref ["roster-week-29"]}
+
+   ;; 7. Clean, cited access-control log entry -> commit.
+   {:practitioner-id "prac-001" :type :log-access-control-entry
+    :post "post-001" :visitor-id "v-77" :direction :in
+    :sign-in-sheet-ref ["sign-in-sheet-2026-07-19"]}
+
+   ;; 8. Flagging a security concern is ALWAYS a hard stop (not merely an
+   ;;    escalation) in this actor, regardless of confidence or citations
+   ;;    -> :safety-concern-escalation hold.
+   {:practitioner-id "prac-001" :type :flag-security-concern
+    :post "post-001" :concern-type :suspicious-vehicle
+    :description "vehicle circling the lot" :observation-ref ["direct-observation"]}
+
+   ;; 9. Unregistered practitioner -> :practitioner-not-registered hold.
+   {:practitioner-id "prac-404" :type :log-patrol-round
+    :post "post-001" :checkpoints ["gate"] :post-orders-ref ["post-orders-v3"]}
+
+   ;; 10. An unrecognized request type maps to {:op :unknown ...} via
+   ;;     mock-advisor's case default, which is itself a permanently
+   ;;     forbidden op -> :forbidden-operation hold.
+   {:practitioner-id "prac-001" :type :not-a-real-operation}])
+
+(defn- run-op!
+  "Build a fresh compiled graph against the CURRENT store value, run one
+   request through it to completion, and (if it stopped at
+   :awaiting-approval) immediately approve it as a human sign-off would.
+   Returns a map describing this step's outcome plus the store value to
+   carry into the next step."
+  [advisor-instance current-store request]
+  (let [graph (actor/build-graph advisor-instance current-store)
+        result (actor/run-request! graph request {})]
+    (case (:phase result)
+      :complete
+      {:request request :outcome :auto-committed
+       :record (last (store/records (:store result)))
+       :store (:store result)}
+
+      :awaiting-approval
+      (let [approved (actor/approve! result {:approver "site-supervisor"} current-store)]
+        {:request request :outcome :approved-and-committed
+         :record (last (store/records (:store approved)))
+         :store (:store approved)})
+
+      :rejected
+      {:request request :outcome :hard-hold
+       :error (:error result)
+       :rule (-> result :decision :violations first :rule)
+       :store (:store result)})))
+
+(defn run-demo!
+  "Run the whole `op-specs` scenario end-to-end against the real actor
+   stack, threading the store forward across steps (see ns docstring).
+   Returns `{:seed-practitioners [...] :seed-posts [...] :runs [...]
+   :final-store store}`."
+  []
+  (let [advisor-instance (advisor/mock-advisor)
+        seed (-> (store/create-store)
+                  (store/register-practitioner! "prac-001" {:name "Alex Rivera"})
+                  (store/register-post! "post-001" {:client "Riverside Mall" :authorized? true})
+                  ;; Disclosed demo-only addition (see ns docstring) via
+                  ;; the real register-post! API.
+                  (store/register-post! "post-002" {:client "Unverified Client" :authorized? false}))
+        {:keys [store runs]}
+        (reduce
+         (fn [{:keys [store runs]} request]
+           (let [outcome (run-op! advisor-instance store request)]
+             {:store (:store outcome) :runs (conj runs outcome)}))
+         {:store seed :runs []}
+         op-specs)]
+    {:seed-practitioners [["prac-001" (store/practitioner seed "prac-001")]]
+     :seed-posts [["post-001" (store/post seed "post-001")]
+                  ["post-002" (store/post seed "post-002")]]
+     :runs runs
+     :final-store store}))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [s]
+  (some-> s str
+          (str/replace "&" "&amp;")
+          (str/replace "<" "&lt;")
+          (str/replace ">" "&gt;")))
+
+(defn- outcome-class [outcome]
+  (case outcome
+    :auto-committed "ok"
+    :approved-and-committed "ok"
+    :hard-hold "err"
+    "muted"))
+
+(defn- outcome-label [outcome]
+  (case outcome
+    :auto-committed "committed (auto)"
+    :approved-and-committed "committed (after human approval)"
+    :hard-hold "HARD HOLD"
+    (name outcome)))
+
+(def ^:private gate-rules
+  "Static description of protective-services.governor/check's own op
+   contract, drawn from its docstring — not invented here."
+  [{:rule "practitioner-not-registered" :kind "hard" :reachable? true
+    :desc "Requesting practitioner must be registered in the store."}
+   {:rule "no-actuation" :kind "hard" :reachable? false
+    :desc "Proposal :effect must be :propose. Not reachable via mock-advisor (always :propose) — exercised directly against governor/check in governor_test.cljc."}
+   {:rule "forbidden-operation" :kind "hard" :reachable? true
+    :desc "Use-of-force authorization, arrest/detention authority, armed-response dispatch, and :unknown ops are permanently excluded — no override, ever."}
+   {:rule "safety-concern-escalation" :kind "hard" :reachable? true
+    :desc "flag-security-concern is ALWAYS a hard stop, even at high confidence — this actor never auto-files or auto-resolves a safety concern."}
+   {:rule "post-record-missing / post-not-authorized" :kind "hard" :reachable? true
+    :desc "Scheduling a shift/assignment requires the referenced post to be registered AND client-authorized."}
+   {:rule "no-spec-basis" :kind "hard" :reachable? true
+    :desc "A known-op proposal with no cited basis (post orders / roster / log entry / witness ref) cannot be treated as grounded."}
+   {:rule "draft-incident-report" :kind "escalate (soft)" :reachable? true
+    :desc "Incident-report drafting always requires human review before being treated as more than a draft — legitimate op, not a permanent block."}
+   {:rule "low confidence (< 0.6)" :kind "escalate (soft)" :reachable? false
+    :desc "Not reachable via mock-advisor — its fixed per-type confidence values (0.7-0.95) never drop below the 0.6 floor; exercised directly against governor/check in governor_test.cljc."}])
+
+(defn- entities-table [rows cols]
+  (str "<table><thead><tr>" (apply str (map #(str "<th>" (esc %) "</th>") cols)) "</tr></thead><tbody>"
+       (apply str rows)
+       "</tbody></table>"))
+
+(defn- render-seed [{:keys [seed-practitioners seed-posts]}]
+  (str
+   "<h2>Registered entities (seed)</h2>\n"
+   "<h3>Practitioners</h3>\n"
+   (entities-table
+    (for [[id {:keys [name]}] seed-practitioners]
+      (str "<tr><td>" (esc id) "</td><td>" (esc name) "</td></tr>\n"))
+    ["id" "name"])
+   "\n<h3>Posts / engagements</h3>\n"
+   (entities-table
+    (for [[id {:keys [client authorized?]}] seed-posts]
+      (str "<tr><td>" (esc id) "</td><td>" (esc client) "</td><td class=\""
+           (if authorized? "ok" "err") "\">" (if authorized? "authorized" "NOT authorized")
+           (when (= id "post-002") " <span class=\"muted\">(disclosed demo-only addition)</span>")
+           "</td></tr>\n"))
+    ["id" "client" "authorization"])))
+
+(defn- render-gate []
+  (str
+   "<h2>Action gate — protective-services.governor/check contract</h2>\n"
+   "<table><thead><tr><th>rule</th><th>kind</th><th>reachable via this demo?</th><th>description</th></tr></thead><tbody>\n"
+   (apply str
+          (for [{:keys [rule kind reachable? desc]} gate-rules]
+            (str "<tr><td>" (esc rule) "</td><td>" (esc kind) "</td><td class=\""
+                 (if reachable? "ok" "muted") "\">" (if reachable? "yes" "no (documented)")
+                 "</td><td>" (esc desc) "</td></tr>\n")))
+   "</tbody></table>"))
+
+(defn- render-runs [runs]
+  (str
+   "<h2>Demo run log (audit trail)</h2>\n"
+   "<p class=\"muted\">One row per request actually run through the compiled StateGraph, in order. "
+   "The store is rebuilt/rethreaded across steps (see generator docstring) so the ledger accumulates.</p>\n"
+   "<table><thead><tr><th>#</th><th>practitioner</th><th>op (request :type)</th><th>outcome</th>"
+   "<th>violated rule</th><th>ledger record type</th></tr></thead><tbody>\n"
+   (apply str
+          (map-indexed
+           (fn [i {:keys [request outcome rule record]}]
+             (str "<tr><td>" (inc i) "</td><td>" (esc (:practitioner-id request)) "</td><td>"
+                  (esc (name (:type request))) "</td><td class=\"" (outcome-class outcome) "\">"
+                  (esc (outcome-label outcome)) "</td><td>" (esc (some-> rule name)) "</td><td>"
+                  (esc (some-> record :type name)) "</td></tr>\n"))
+           runs))
+   "</tbody></table>"))
+
+(defn render [demo-result]
+  (str
+   "<html><head><meta charset=\"utf-8\">"
+   "<title>cloud-itonami-isco-5419 — Protective Services operator console (sample)</title>"
+   "<style>"
+   "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}"
+   "h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ddd;padding-bottom:.25rem}"
+   "table{border-collapse:collapse;width:100%;margin:.5rem 0 1rem}"
+   "th,td{border:1px solid #ddd;padding:.4rem .6rem;text-align:left;font-size:.92rem}"
+   "th{background:#f4f4f4}"
+   ".ok{color:#0a7a2f;font-weight:600}.err{color:#b3261e;font-weight:600}.warn{color:#a35a00;font-weight:600}"
+   ".critical{color:#fff;background:#b3261e;font-weight:700}.muted{color:#6b6b6b}"
+   "footer{margin-top:2rem;color:#6b6b6b;font-size:.85rem}"
+   "</style></head><body>\n"
+   "<h1>cloud-itonami-isco-5419 — Independent Protective Services Practice</h1>\n"
+   "<p class=\"muted\">Build-time-generated operator console sample. Every table below is real output "
+   "of running <code>protective-services.actor</code>'s compiled StateGraph "
+   "(<code>protective-services.advisor/mock-advisor</code> + a real "
+   "<code>protective-services.store/MemStore</code>) against a real request scenario. "
+   "No timestamps or random data appear in this page; it is regenerated by "
+   "<code>clojure -M:render-html</code> (see <code>.github/workflows/regenerate.yml</code>) and is "
+   "byte-identical across reruns against the same seed.</p>\n"
+   (render-seed demo-result) "\n"
+   (render-gate) "\n"
+   (render-runs (:runs demo-result)) "\n"
+   "<footer>Generated by <code>protective-services.render-html</code> — "
+   "no fabricated data, no invented timestamps. "
+   "Two governor rules (<code>no-actuation</code>, low-confidence escalation) are not reachable "
+   "through this demo's mock advisor and are disclosed as such above rather than omitted silently.</footer>\n"
+   "</body></html>\n"))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        html (render result)]
+    (spit out html)
+    (println "wrote" out)))
