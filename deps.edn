@@ -4,7 +4,12 @@
         {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
          :git/sha "83db99546eabc53613ae826ea41d1533a3c574af"}
 io.github.kotoba-lang/langgraph
-        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}}
+        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}
+        ;; The verdict assembly, shared instead of hand-copied. This repo is
+        ;; where the fleet's one drifted copy was found (ADR-2607309100).
+        io.github.kotoba-lang/governor
+        {:git/url "https://github.com/kotoba-lang/governor.git"
+         :git/sha "8df632b6610d30f6fef4edd9782cb1659bedb727"}}
  :aliases
  {
   ;; clj-kondo from deps (no binary), errors fail CI. Added because this repo
