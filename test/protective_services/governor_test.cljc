@@ -4,7 +4,8 @@
    broke cloud-itonami-isic-0710 for a full day: a private var is not a
    stable/compilable test target). Every governor rule is proven through
    its real call path."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [governor.core]
+            [clojure.test :refer [deftest is testing]]
             [protective-services.governor :as gov]
             [protective-services.store :as store]))
 
@@ -102,9 +103,51 @@
                     :cites ["direct-observation"]}
           verdict (gov/check request {} proposal st)]
       (is (true? (:hard? verdict)))
-      (is (true? (:escalate? verdict)))
+      ;; Corrected 2026-07-30 (ADR-2607309100). This assertion previously read
+      ;; `(is (true? (:escalate? verdict)))`, which contradicted this very
+      ;; deftest's name and the governor's own docstring: a HARD stop is
+      ;; "not merely an escalation ... this actor has no authority to act on a
+      ;; safety concern in any way and must not appear to". Reporting it as
+      ;; escalatable is precisely appearing to. The test was written to match a
+      ;; hand-copied verdict line that had drifted from all 346 siblings; both
+      ;; are fixed now, and `conformance` below pins the property rather than
+      ;; the literal.
+      (is (false? (:escalate? verdict))
+          "a HARD stop with no override path is not a thing a human can approve")
       (is (false? (:ok? verdict)))
       (is (some #(= :safety-concern-escalation (:rule %)) (:violations verdict))))))
+
+(deftest test-every-verdict-is-well-formed
+  (testing "conformance against kotoba-lang/governor — the property, not the literal.
+            This is what would have caught the drift the day it was introduced."
+    (let [st (registered-store)
+          request {:practitioner-id "prac-001" :post "post-001"}
+          proposals [{:op :log-patrol-round :effect :propose :confidence 0.9
+                      :post "post-001" :cites ["post-orders-v3"]}
+                     {:op :log-patrol-round :effect :propose :confidence 0.4
+                      :post "post-001" :cites ["post-orders-v3"]}
+                     {:op :draft-incident-report :effect :propose :confidence 0.9
+                      :post "post-001" :summary "s" :cites ["w"]}
+                     {:op :flag-security-concern :effect :propose :confidence 0.95
+                      :post "post-001" :concern-type :suspicious-vehicle
+                      :cites ["direct-observation"]}
+                     {:op :authorize-use-of-force :effect :propose :confidence 0.99
+                      :post "post-001" :cites ["x"]}
+                     {:op :log-patrol-round :effect :execute :confidence 0.9
+                      :post "post-001" :cites ["x"]}
+                     {:op :unknown :effect :propose :confidence 0.1}]]
+      (doseq [p proposals]
+        (let [v (gov/check request {} p st)]
+          (is (empty? (governor.core/conformance-failures v))
+              (str (:op p) " → " (pr-str (governor.core/conformance-failures v))))))
+      (testing "and no forbidden op is ever reported as approvable"
+        (doseq [op [:authorize-use-of-force :authorize-arrest-or-detention
+                    :dispatch-armed-response :flag-security-concern]]
+          (let [v (gov/check request {} {:op op :effect :propose :confidence 0.99
+                                         :post "post-001" :cites ["x"]
+                                         :concern-type :suspicious-vehicle} st)]
+            (is (true? (:hard? v)) (str op))
+            (is (false? (:escalate? v)) (str op " must never read as awaiting sign-off"))))))))
 
 (deftest test-flag-security-concern-hold-fact-is-auditable
   (testing "hold-fact produces an auditable record referencing the safety-concern

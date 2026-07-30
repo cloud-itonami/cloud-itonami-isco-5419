@@ -76,7 +76,8 @@
                                       more than a draft; this actor never
                                       produces a final legal record.
     8. low confidence              (< `confidence-floor`)."
-  (:require [protective-services.store :as store]))
+  (:require [governor.core :as gov]
+            [protective-services.store :as store]))
 
 (def confidence-floor 0.6)
 
@@ -196,20 +197,28 @@
 (defn check
   "Assess a proposal against `request`/`context`/`proposal` and a `store`
    implementing `protective-services.store/Store`. Returns
-   `{:ok? bool :violations [...] :confidence n :hard? bool :escalate? bool}`."
-  [request context proposal store]
-  (let [practitioner-record (store/practitioner store (:practitioner-id request))
-        hard (hard-violations proposal practitioner-record store)
-        hard? (boolean (seq hard))
-        conf (or (:confidence proposal) 0.0)
-        low? (< conf confidence-floor)
-        escalating-op? (or (contains? escalating-ops (:op proposal))
-                            (contains? escalate-always (:op proposal)))]
-    {:ok? (and (not hard?) (not low?) (not escalating-op?))
-     :violations hard
-     :confidence conf
-     :hard? hard?
-     :escalate? (or hard? low? escalating-op?)}))
+   `{:ok? bool :violations [...] :confidence n :hard? bool :escalate? bool
+     :escalation-reason kw-or-nil}`.
+
+   The verdict assembly comes from `kotoba-lang/governor`, not from a local
+   copy. Until 2026-07-30 this function computed
+   `:escalate? (or hard? low? escalating-op?)` while all 346 sibling actors
+   computed `(and (not hard?) (or low? escalating-op?))` — a hand-copy that
+   had drifted. The routing was never wrong (`actor/route` tests `:hard?`
+   first), but the verdict told every other reader that a permanently
+   refused proposal was awaiting sign-off: this actor's `forbidden-ops` and
+   `:flag-security-concern` holds are explicitly ones **no human approval can
+   grant**, and the verdict said a human could approve them. Corrected by
+   adopting the shared library; `governor-test` now pins the shape with
+   `gov/conformance-failures`."
+  [request _context proposal store]
+  (let [practitioner-record (store/practitioner store (:practitioner-id request))]
+    (gov/verdict
+     {:violations (hard-violations proposal practitioner-record store)
+      :confidence (:confidence proposal)
+      :confidence-floor confidence-floor
+      :escalating-op? (or (contains? escalating-ops (:op proposal))
+                          (contains? escalate-always (:op proposal)))})))
 
 (defn hold-fact
   "The audit fact written when a proposal is rejected (HOLD) — appended to
