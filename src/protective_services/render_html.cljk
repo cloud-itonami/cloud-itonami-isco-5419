@@ -10,7 +10,7 @@
   `protective-services.store/MemStore`) through a scenario built from:
     - the existing test fixture's seed data verbatim
       (`prac-001` \"Alex Rivera\" / `post-001` \"Riverside Mall\",
-      authorized), taken from `test/protective_services/actor_test.cljc`'s
+      authorized), taken from `test/protective_services/actor_test.cljk`'s
       `seeded-store`
     - one disclosed demo-only addition, `post-002` (\"Unverified Client\",
       NOT authorized) — registered here via the real
