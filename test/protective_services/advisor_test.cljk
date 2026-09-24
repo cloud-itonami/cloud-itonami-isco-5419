@@ -1,5 +1,5 @@
 (ns protective-services.advisor-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [protective-services.advisor :as advisor]))
 
 (deftest test-mock-advisor-always-proposes

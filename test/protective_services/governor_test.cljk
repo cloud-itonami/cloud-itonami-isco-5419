@@ -5,7 +5,7 @@
    stable/compilable test target). Every governor rule is proven through
    its real call path."
   (:require [governor.core]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [protective-services.governor :as gov]
             [protective-services.store :as store]))
 

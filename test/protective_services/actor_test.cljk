@@ -2,7 +2,7 @@
   "End-to-end tests of the compiled StateGraph, exercising ONLY the public
    `actor/build-graph`, `actor/run-request!`, and `actor/approve!` entry
    points — never a private node function directly."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [protective-services.actor :as actor]
             [protective-services.advisor :as advisor]
             [protective-services.store :as store]))
